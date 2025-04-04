@@ -31,7 +31,7 @@ var (
 	transmitMutex sync.RWMutex
 
 	selfID       int16      // Unique ID for this instance.
-	headerMarker int16 = 0xABCD // Marker to identify our packet header.
+	headerMarker int16 = 0x7BCD // Marker to identify our packet header.
 )
 
 // RingBuffer structure optimized
@@ -203,7 +203,7 @@ func receiveAudio(ctx context.Context, rb *RingBuffer) {
 			return
 		default:
 			conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
-			n, addr, err := conn.ReadFromUDP(buf)
+			n, _, err := conn.ReadFromUDP(buf)
 			if err != nil {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 					continue
