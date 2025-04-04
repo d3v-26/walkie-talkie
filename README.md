@@ -14,16 +14,18 @@ This is a simple walkie-talkie–style application written in Go that lets users
 
 1. **Clone the Repository**
 
-   ```bash
+    ```bash
         git clone https://github.com/yourusername/walkietalkie.git
         cd walkietalkie
     ```
 2. **Download Dependencies**
-```bash
-    go mod tidy
-```
+
+    ```bash
+        go mod tidy
+    ```
 
 3. **Run the Application**
-```bash
-    go run main.go
-```
+
+    ```bash
+        go run main.go
+    ```
