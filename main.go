@@ -1,7 +1,7 @@
 package main
 
 import (
-	"bytes"
+	"context"
 	"log"
 	"net"
 	"sync"
@@ -15,21 +15,19 @@ import (
 )
 
 const (
-	sampleRate      = 16000         // Samples per second (mono)
-	framesPerBuffer = 512           // Number of samples per buffer (adjusted to fit MTU)
-	udpPort         = 3000          // UDP port for both sending and receiving
+	sampleRate      = 16000
+	framesPerBuffer = 512
+	udpPort         = 3000
+	bufferSize      = framesPerBuffer * 2
 )
 
-// Broadcast address for the local network (IPv4 broadcast)
-var broadcastAddr = net.UDPAddr{IP: net.IPv4bcast, Port: udpPort}
-
-// Global flag to control transmission.
 var (
-	transmitting  = false
-	transmitMutex sync.Mutex
+	broadcastAddr = net.UDPAddr{IP: net.IPv4bcast, Port: udpPort}
+	transmitting  bool
+	transmitMutex sync.RWMutex
 )
 
-// RingBuffer holds int16 samples.
+// RingBuffer structure optimized
 type RingBuffer struct {
 	buf       []int16
 	size      int
@@ -39,7 +37,6 @@ type RingBuffer struct {
 	mu        sync.Mutex
 }
 
-// NewRingBuffer creates a new ring buffer of the given size.
 func NewRingBuffer(size int) *RingBuffer {
 	return &RingBuffer{
 		buf:  make([]int16, size),
@@ -47,57 +44,55 @@ func NewRingBuffer(size int) *RingBuffer {
 	}
 }
 
-// Write writes samples into the ring buffer.
 func (r *RingBuffer) Write(samples []int16) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
 	for _, s := range samples {
 		if r.available < r.size {
 			r.buf[r.writePos] = s
 			r.writePos = (r.writePos + 1) % r.size
 			r.available++
 		} else {
-			// Buffer full; you might log or drop extra samples.
+			log.Println("RingBuffer overflow, sample dropped")
+			break
 		}
 	}
 }
 
-// Read reads up to len(buffer) samples from the ring buffer into buffer.
-// It returns the number of samples read.
-func (r *RingBuffer) Read(buffer []int16) int {
+func (r *RingBuffer) Read(out []int16) int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
 	count := 0
-	for i := range buffer {
-		if r.available > 0 {
-			buffer[i] = r.buf[r.readPos]
-			r.readPos = (r.readPos + 1) % r.size
-			r.available--
-			count++
-		} else {
-			break
-		}
+	for count < len(out) && r.available > 0 {
+		out[count] = r.buf[r.readPos]
+		r.readPos = (r.readPos + 1) % r.size
+		r.available--
+		count++
 	}
 	return count
 }
 
 func main() {
-	// Initialize PortAudio.
 	if err := portaudio.Initialize(); err != nil {
-		log.Fatal("Error initializing PortAudio:", err)
+		log.Fatalf("PortAudio initialization failed: %v", err)
 	}
 	defer portaudio.Terminate()
 
-	// Create a ring buffer that can hold about 10 audio buffers.
-	ringBuffer := NewRingBuffer(framesPerBuffer * 10)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	// Start UDP receiver in a goroutine, passing the ring buffer.
-	go receiveAudio(ringBuffer)
+	ringBuffer := NewRingBuffer(framesPerBuffer * 20)
 
-	// Start a playback goroutine.
-	go playbackAudio(ringBuffer)
+	go receiveAudio(ctx, ringBuffer)
+	go playbackAudio(ctx, ringBuffer)
 
-	// Create the GUI using Fyne.
+	startGUI(ctx, cancel)
+}
+
+// GUI with Fyne
+func startGUI(ctx context.Context, cancel context.CancelFunc) {
 	a := app.New()
 	w := a.NewWindow("Walkie Talkie")
 
@@ -111,7 +106,7 @@ func main() {
 
 		if active {
 			button.SetText("Stop Talking")
-			go transmitAudio() // Start transmitting in a goroutine.
+			go transmitAudio(ctx)
 		} else {
 			button.SetText("Push to Talk")
 		}
@@ -119,14 +114,15 @@ func main() {
 
 	w.SetContent(container.NewCenter(button))
 	w.Resize(fyne.NewSize(200, 100))
+	w.SetOnClosed(func() { cancel() })
 	w.ShowAndRun()
 }
 
-// transmitAudio captures audio from the microphone and sends it as UDP packets.
-func transmitAudio() {
+// transmitAudio handles microphone capture and UDP broadcast
+func transmitAudio(ctx context.Context) {
 	conn, err := net.DialUDP("udp4", nil, &broadcastAddr)
 	if err != nil {
-		log.Println("Error dialing UDP:", err)
+		log.Printf("UDP dial error: %v", err)
 		return
 	}
 	defer conn.Close()
@@ -134,115 +130,128 @@ func transmitAudio() {
 	in := make([]int16, framesPerBuffer)
 	stream, err := portaudio.OpenDefaultStream(1, 0, sampleRate, len(in), in)
 	if err != nil {
-		log.Println("Error opening input stream:", err)
+		log.Printf("Input stream error: %v", err)
 		return
 	}
 	defer stream.Close()
 
 	if err := stream.Start(); err != nil {
-		log.Println("Error starting input stream:", err)
+		log.Printf("Input stream start error: %v", err)
 		return
 	}
 	defer stream.Stop()
 
-	log.Println("Started transmitting audio...")
+	log.Println("Transmitting started.")
 	for {
-		transmitMutex.Lock()
-		active := transmitting
-		transmitMutex.Unlock()
-		if !active {
-			break
+		select {
+		case <-ctx.Done():
+			log.Println("Transmit context cancelled")
+			return
+		default:
+			transmitMutex.RLock()
+			active := transmitting
+			transmitMutex.RUnlock()
+
+			if !active {
+				log.Println("Stopped transmitting by user.")
+				return
+			}
+
+			if err := stream.Read(); err != nil {
+				log.Printf("Audio read error: %v", err)
+				continue
+			}
+
+			if _, err := conn.Write(int16ToBytes(in)); err != nil {
+				log.Printf("UDP send error: %v", err)
+			}
 		}
-		if err := stream.Read(); err != nil {
-			log.Println("Error reading from input stream:", err)
-			break
-		}
-		buf := int16SliceToBytes(in)
-		if _, err := conn.Write(buf); err != nil {
-			log.Println("Error sending UDP packet:", err)
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
 	}
-	log.Println("Stopped transmitting audio.")
 }
 
-// receiveAudio listens on the UDP port for incoming audio, decodes it, and writes to the ring buffer.
-func receiveAudio(rb *RingBuffer) {
-	addr := net.UDPAddr{
-		Port: udpPort,
-		IP:   net.IPv4zero,
-	}
-	conn, err := net.ListenUDP("udp4", &addr)
+// receiveAudio listens for UDP packets and writes to RingBuffer
+func receiveAudio(ctx context.Context, rb *RingBuffer) {
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: udpPort})
 	if err != nil {
-		log.Println("Error starting UDP listener:", err)
-		return
+		log.Fatalf("UDP listen error: %v", err)
 	}
 	defer conn.Close()
 
-	// Use a buffer size matching the packet size (framesPerBuffer * 2 bytes per sample).
-	buf := make([]byte, framesPerBuffer*2)
+	buf := make([]byte, bufferSize)
+	log.Println("Receiving audio...")
+
 	for {
-		n, _, err := conn.ReadFromUDP(buf)
-		if err != nil {
-			log.Println("Error receiving UDP packet:", err)
-			continue
+		select {
+		case <-ctx.Done():
+			log.Println("Receive context cancelled")
+			return
+		default:
+			conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+			n, _, err := conn.ReadFromUDP(buf)
+			if err != nil {
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					continue
+				}
+				log.Printf("UDP read error: %v", err)
+				continue
+			}
+			rb.Write(bytesToInt16(buf[:n]))
 		}
-		samples := bytesToInt16Slice(buf[:n])
-		rb.Write(samples)
 	}
 }
 
-// playbackAudio continuously reads audio samples from the ring buffer and writes them to the output stream.
-func playbackAudio(rb *RingBuffer) {
+// playbackAudio outputs audio from RingBuffer
+func playbackAudio(ctx context.Context, rb *RingBuffer) {
 	out := make([]int16, framesPerBuffer)
 	stream, err := portaudio.OpenDefaultStream(0, 1, sampleRate, len(out), &out)
 	if err != nil {
-		log.Println("Error opening output stream:", err)
-		return
+		log.Fatalf("Output stream error: %v", err)
 	}
 	defer stream.Close()
 
 	if err := stream.Start(); err != nil {
-		log.Println("Error starting output stream:", err)
-		return
+		log.Fatalf("Output stream start error: %v", err)
 	}
 	defer stream.Stop()
 
 	log.Println("Playback started.")
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
 	for {
-		// Read samples from the ring buffer.
-		n := rb.Read(out)
-		// If fewer than expected, fill remainder with silence.
-		if n < len(out) {
-			for i := n; i < len(out); i++ {
-				out[i] = 0
+		select {
+		case <-ctx.Done():
+			log.Println("Playback context cancelled")
+			return
+		case <-ticker.C:
+			n := rb.Read(out)
+			if n < len(out) {
+				// Fill remainder with silence
+				for i := n; i < len(out); i++ {
+					out[i] = 0
+				}
+			}
+			if err := stream.Write(); err != nil {
+				log.Printf("Playback error: %v", err)
 			}
 		}
-		if err := stream.Write(); err != nil {
-			log.Println("Error writing to output stream:", err)
-		}
-		// You may adjust the sleep duration if needed.
-		time.Sleep(10 * time.Millisecond)
 	}
 }
 
-// int16SliceToBytes converts a slice of int16 samples to a byte slice (little-endian).
-func int16SliceToBytes(samples []int16) []byte {
-	buf := new(bytes.Buffer)
-	for _, s := range samples {
-		buf.WriteByte(byte(s))
-		buf.WriteByte(byte(s >> 8))
+// Helpers
+func int16ToBytes(samples []int16) []byte {
+	buf := make([]byte, len(samples)*2)
+	for i, s := range samples {
+		buf[2*i] = byte(s)
+		buf[2*i+1] = byte(s >> 8)
 	}
-	return buf.Bytes()
+	return buf
 }
 
-// bytesToInt16Slice converts a byte slice to a slice of int16 samples (little-endian).
-func bytesToInt16Slice(b []byte) []int16 {
-	length := len(b) / 2
-	samples := make([]int16, length)
-	for i := 0; i < length; i++ {
-		samples[i] = int16(b[2*i]) | int16(b[2*i+1])<<8
+func bytesToInt16(data []byte) []int16 {
+	samples := make([]int16, len(data)/2)
+	for i := range samples {
+		samples[i] = int16(data[2*i]) | int16(data[2*i+1])<<8
 	}
 	return samples
 }
