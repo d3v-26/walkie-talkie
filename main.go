@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"log"
+	"math/rand"
 	"net"
 	"sync"
 	"time"
@@ -18,13 +19,19 @@ const (
 	sampleRate      = 16000
 	framesPerBuffer = 512
 	udpPort         = 3000
-	bufferSize      = framesPerBuffer * 2
+	// The header is 2 int16 values (4 bytes):
+	headerSizeBytes = 4
+	// The UDP buffer must now accommodate the header plus audio data.
+	bufferSize = framesPerBuffer*2 + headerSizeBytes
 )
 
 var (
 	broadcastAddr = net.UDPAddr{IP: net.IPv4bcast, Port: udpPort}
 	transmitting  bool
 	transmitMutex sync.RWMutex
+
+	selfID       int16      // Unique ID for this instance.
+	headerMarker int16 = 0xABCD // Marker to identify our packet header.
 )
 
 // RingBuffer structure optimized
@@ -75,6 +82,10 @@ func (r *RingBuffer) Read(out []int16) int {
 }
 
 func main() {
+	// Generate a unique ID for this instance.
+	rand.Seed(time.Now().UnixNano())
+	selfID = int16(rand.Intn(65536))
+
 	if err := portaudio.Initialize(); err != nil {
 		log.Fatalf("PortAudio initialization failed: %v", err)
 	}
@@ -96,7 +107,6 @@ func startGUI(ctx context.Context, cancel context.CancelFunc) {
 	a := app.New()
 	w := a.NewWindow("Walkie Talkie")
 
-	// Pre-declare the button variable.
 	var button *widget.Button
 	button = widget.NewButton("Push to Talk", func() {
 		transmitMutex.Lock()
@@ -118,7 +128,8 @@ func startGUI(ctx context.Context, cancel context.CancelFunc) {
 	w.ShowAndRun()
 }
 
-// transmitAudio handles microphone capture and UDP broadcast
+// transmitAudio handles microphone capture and UDP broadcast.
+// It prepends a header [marker, selfID] to each packet.
 func transmitAudio(ctx context.Context) {
 	conn, err := net.DialUDP("udp4", nil, &broadcastAddr)
 	if err != nil {
@@ -162,14 +173,19 @@ func transmitAudio(ctx context.Context) {
 				continue
 			}
 
-			if _, err := conn.Write(int16ToBytes(in)); err != nil {
+			// Create packet: header ([marker, selfID]) + audio samples.
+			header := []int16{headerMarker, selfID}
+			packet := append(int16ToBytes(header), int16ToBytes(in)...)
+
+			if _, err := conn.Write(packet); err != nil {
 				log.Printf("UDP send error: %v", err)
 			}
 		}
 	}
 }
 
-// receiveAudio listens for UDP packets and writes to RingBuffer
+// receiveAudio listens for UDP packets and writes audio data to the RingBuffer.
+// It skips packets that originate from this instance.
 func receiveAudio(ctx context.Context, rb *RingBuffer) {
 	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: udpPort})
 	if err != nil {
@@ -187,7 +203,7 @@ func receiveAudio(ctx context.Context, rb *RingBuffer) {
 			return
 		default:
 			conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
-			n, _, err := conn.ReadFromUDP(buf)
+			n, addr, err := conn.ReadFromUDP(buf)
 			if err != nil {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 					continue
@@ -195,12 +211,32 @@ func receiveAudio(ctx context.Context, rb *RingBuffer) {
 				log.Printf("UDP read error: %v", err)
 				continue
 			}
-			rb.Write(bytesToInt16(buf[:n]))
+
+			if n < headerSizeBytes {
+				log.Println("Packet too short, ignoring.")
+				continue
+			}
+
+			// Extract header.
+			headerSamples := bytesToInt16(buf[:headerSizeBytes])
+			if headerSamples[0] != headerMarker {
+				log.Println("Invalid header marker, ignoring packet.")
+				continue
+			}
+			// Ignore packets sent by this instance.
+			if headerSamples[1] == selfID {
+				// Optionally log: log.Printf("Ignored own packet from %v", addr)
+				continue
+			}
+
+			// Write the audio data (excluding the header) to the ring buffer.
+			audioData := buf[headerSizeBytes:n]
+			rb.Write(bytesToInt16(audioData))
 		}
 	}
 }
 
-// playbackAudio outputs audio from RingBuffer
+// playbackAudio outputs audio from RingBuffer.
 func playbackAudio(ctx context.Context, rb *RingBuffer) {
 	out := make([]int16, framesPerBuffer)
 	stream, err := portaudio.OpenDefaultStream(0, 1, sampleRate, len(out), &out)
@@ -226,7 +262,7 @@ func playbackAudio(ctx context.Context, rb *RingBuffer) {
 		case <-ticker.C:
 			n := rb.Read(out)
 			if n < len(out) {
-				// Fill remainder with silence
+				// Fill the remainder with silence.
 				for i := n; i < len(out); i++ {
 					out[i] = 0
 				}
@@ -238,7 +274,7 @@ func playbackAudio(ctx context.Context, rb *RingBuffer) {
 	}
 }
 
-// Helpers
+// Helpers: convert between int16 slices and byte slices.
 func int16ToBytes(samples []int16) []byte {
 	buf := make([]byte, len(samples)*2)
 	for i, s := range samples {
